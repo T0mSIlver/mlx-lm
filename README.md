@@ -1,8 +1,8 @@
 ## What this fork changes
 
-- **Chat prompt-cache checkpointing for split prompts** — `mlx_lm.server` can checkpoint a stable prefix before the final `user` message, which lets requests shaped like `system + static user + dynamic user` reuse the shared prompt prefix across calls
-- **Stable prefix preservation** — reusable checkpoint caches are no longer displaced by later full-request cache inserts on the same prefix path
-- **Cached-prefix checkpoint correction** — when a request already reused cached tokens, follow-up checkpoints are now computed relative to the uncached tail, which prevents alternating cache hits and misses across successive requests
+- **Chat prompt-cache checkpointing for split prompts** — upstream `mlx_lm.server` checkpoints chat prompts near the end of the request; this fork can checkpoint before the final `user` message, which lets prompts shaped like `system + static user + dynamic user` reuse their shared prefix across calls
+- **Reusable prefix cache stays available** — upstream behavior can replace that shared-prefix checkpoint with later full-request cache entries on the same path; this fork keeps the reusable checkpoint available so subsequent requests can keep hitting the common prefix
+- **Cached requests re-checkpoint the right span** — after a request already reused cached tokens, this fork computes the next checkpoint relative to the remaining uncached tail instead of the original full prompt, which avoids the alternating hit/miss pattern we saw with repeated split-prompt requests
 
 ---
 
