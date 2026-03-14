@@ -1,8 +1,8 @@
 ## What this fork changes
 
-- **Chat prompt-cache checkpointing for split prompts** — upstream `mlx_lm.server` checkpoints chat prompts near the end of the request; this fork can checkpoint before the final `user` message, which lets prompts shaped like `system + static user + dynamic user` reuse their shared prefix across calls
-- **Reusable prefix cache stays available** — upstream behavior can replace that shared-prefix checkpoint with later full-request cache entries on the same path; this fork keeps the reusable checkpoint available so subsequent requests can keep hitting the common prefix
-- **Cached requests re-checkpoint the right span** — after a request already reused cached tokens, this fork computes the next checkpoint relative to the remaining uncached tail instead of the original full prompt, which avoids the alternating hit/miss pattern we saw with repeated split-prompt requests
+- **Checkpoint before the dynamic tail for split chat prompts** — on `upstream/main`, chat checkpointing falls back to the end of the prompt. This fork adds a second path for requests shaped like `system + static user + dynamic user`: if there is already an earlier `user` message, it checkpoints the prompt right before the final `user` message, so later requests can reuse the whole shared prefix.
+- **Keep the shared-prefix checkpoint even after a full request finishes** — on `upstream/main`, inserting a later trimmable cache entry deletes any shorter cache entry it encounters on the same token path. For split prompts, that means the reusable shared-prefix checkpoint can be removed when the server stores a later full-request cache. This fork preserves checkpoint entries when later non-checkpoint caches are inserted, so the shared prefix remains available for future requests.
+- **Recompute the next checkpoint relative to the uncached remainder** — in `mlx_lm`, checkpoint positions are interpreted relative to the prompt segment that still needs to be processed. After a cache hit, `upstream/main` still uses the checkpoint position derived from the original full prompt, which can make the next saved checkpoint land at the wrong place. This fork subtracts the already reused prefix before scheduling the next checkpoint, so repeated split-prompt requests keep re-saving the shared prefix instead of alternating between hits and misses.
 
 ---
 
