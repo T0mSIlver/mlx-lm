@@ -1,3 +1,11 @@
+## What this fork changes
+
+- **Chat prompt-cache checkpointing for split prompts** — `mlx_lm.server` can checkpoint a stable prefix before the final `user` message, which lets requests shaped like `system + static user + dynamic user` reuse the shared prompt prefix across calls
+- **Stable prefix preservation** — reusable checkpoint caches are no longer displaced by later full-request cache inserts on the same prefix path
+- **Cached-prefix checkpoint correction** — when a request already reused cached tokens, follow-up checkpoints are now computed relative to the uncached tail, which prevents alternating cache hits and misses across successive requests
+
+---
+
 ## MLX LM 
 
 MLX LM is a Python package for generating text and fine-tuning large language

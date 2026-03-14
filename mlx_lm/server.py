@@ -113,7 +113,11 @@ def sequence_overlap(s1: Sequence, s2: Sequence) -> bool:
     return any(s1[-i:] == s2[:i] for i in range(1, max_overlap + 1))
 
 
-def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
+def convert_chat(
+    messages: List[dict],
+    role_mapping: Optional[dict] = None,
+    add_generation_prompt: bool = True,
+):
     default_role_mapping = {
         "system_prompt": (
             "A chat between a curious user and an artificial intelligence "
@@ -133,7 +137,8 @@ def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
         content = line.get("content", "")
         prompt += f"{role_prefix}{content}{stop}"
 
-    prompt += role_mapping.get("assistant", "")
+    if add_generation_prompt:
+        prompt += role_mapping.get("assistant", "")
     return prompt.rstrip()
 
 
@@ -177,6 +182,7 @@ class LRUPromptCache:
     class CacheEntry:
         prompt_cache: List[Any]
         nbytes: int
+        checkpoint: bool = False
 
     class CacheOrder:
         def __init__(self):
@@ -316,16 +322,20 @@ class LRUPromptCache:
             if tok not in current:
                 current[tok] = {}
             if is_trimmable and "cache" in current:
-                self._n_bytes -= current["cache"].nbytes
-                del current["cache"]
-                self._lru.remove(model, tokens[:i])
+                existing_cache = current["cache"]
+                if checkpoint or not existing_cache.checkpoint:
+                    self._n_bytes -= existing_cache.nbytes
+                    del current["cache"]
+                    self._lru.remove(model, tokens[:i])
             current = current[tok]
 
         if "cache" in current:
             self._lru.remove(model, tokens)
         else:
             cache_bytes = sum(c.nbytes for c in prompt_cache)
-            current["cache"] = self.CacheEntry(prompt_cache, cache_bytes)
+            current["cache"] = self.CacheEntry(
+                prompt_cache, cache_bytes, checkpoint=checkpoint
+            )
             self._n_bytes += cache_bytes
 
         self._lru.push(model, tokens, checkpoint=checkpoint)
@@ -704,42 +714,85 @@ class ResponseGenerator:
         rq = request[0] if request is not None else Queue()
         return rq, *shareable
 
+    def _tokenize_chat_messages(
+        self,
+        tokenizer,
+        messages,
+        tools,
+        role_mapping,
+        args,
+        *,
+        add_generation_prompt: bool,
+    ):
+        if tokenizer.has_chat_template:
+            process_message_content(messages)
+            if tools and not tokenizer.has_tool_calling:
+                logging.warning(
+                    "Received tools but model does not support tool calling. "
+                    "If you think this is an error, file an issue here: "
+                    "https://github.com/ml-explore/mlx-lm/issues"
+                )
+
+            chat_template_args = self.model_provider.cli_args.chat_template_args
+            if args.chat_template_kwargs:
+                chat_template_args = chat_template_args.copy()
+                chat_template_args.update(args.chat_template_kwargs)
+            return tokenizer.apply_chat_template(
+                messages,
+                tools=tools,
+                add_generation_prompt=add_generation_prompt,
+                tokenize=True,
+                **chat_template_args,
+            )
+
+        return tokenizer.encode(
+            convert_chat(
+                messages,
+                role_mapping,
+                add_generation_prompt=add_generation_prompt,
+            )
+        )
+
     def _tokenize(self, tokenizer, request, args):
         if request.request_type == "chat":
-            messages = request.messages
-            tools = request.tools
-            role_mapping = request.role_mapping
-
-            if tokenizer.has_chat_template:
-                process_message_content(messages)
-                if tools and not tokenizer.has_tool_calling:
-                    logging.warning(
-                        "Received tools but model does not support tool calling. "
-                        "If you think this is an error, file an issue here: "
-                        "https://github.com/ml-explore/mlx-lm/issues"
-                    )
-
-                chat_template_args = self.model_provider.cli_args.chat_template_args
-                if args.chat_template_kwargs:
-                    chat_template_args = chat_template_args.copy()
-                    chat_template_args.update(args.chat_template_kwargs)
-                return tokenizer.apply_chat_template(
-                    messages,
-                    tools=tools,
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    **chat_template_args,
-                )
-            else:
-                return tokenizer.encode(convert_chat(messages, role_mapping))
+            return self._tokenize_chat_messages(
+                tokenizer,
+                request.messages,
+                request.tools,
+                request.role_mapping,
+                args,
+                add_generation_prompt=True,
+            )
         else:
             return tokenizer.encode(request.prompt)
 
-    def _compute_prompt_checkpoint(self, tokenizer, request, prompt):
+    def _compute_prompt_checkpoint(self, tokenizer, request, args, prompt):
         if request.request_type != "chat":
             return False, -1
         if request.messages[-1]["role"] != "user":
             return False, -1
+
+        prefix_messages = request.messages[:-1]
+        has_user_in_prefix = any(
+            message.get("role") == "user" for message in prefix_messages
+        )
+        if prefix_messages and has_user_in_prefix:
+            try:
+                prefix_prompt = self._tokenize_chat_messages(
+                    tokenizer,
+                    copy.deepcopy(prefix_messages),
+                    request.tools,
+                    request.role_mapping,
+                    args,
+                    add_generation_prompt=False,
+                )
+                if 0 < len(prefix_prompt) < len(prompt):
+                    return True, len(prefix_prompt)
+            except Exception:
+                logging.debug(
+                    "Falling back to end-of-prompt checkpoint selection.",
+                    exc_info=True,
+                )
 
         # Save the KV cache at the end of the prompt just before
         # the think start token which will likely be removed in the
@@ -752,6 +805,15 @@ class ResponseGenerator:
                     break
 
         return True, prompt_checkpoint
+
+    def _adjust_prompt_checkpoint_for_cached_prefix(
+        self, checkpoint_position: int, cached_prefix_count: int
+    ) -> int:
+        if checkpoint_position <= 0:
+            return checkpoint_position
+
+        adjusted_position = checkpoint_position - cached_prefix_count
+        return adjusted_position if adjusted_position > 0 else -1
 
     def _is_batchable(self, args):
         if not self.model_provider.is_batchable:
@@ -851,9 +913,16 @@ class ResponseGenerator:
                     if cache is None:
                         cache = make_prompt_cache(self.model_provider.model)
 
-                    do_checkpoint, checkpoint_position = (
-                        self._compute_prompt_checkpoint(tokenizer, request, prompt)
+                    do_checkpoint, checkpoint_position = self._compute_prompt_checkpoint(
+                        tokenizer, request, args, prompt
                     )
+                    checkpoint_position = (
+                        self._adjust_prompt_checkpoint_for_cached_prefix(
+                            checkpoint_position, ctx.prompt_cache_count
+                        )
+                    )
+                    if checkpoint_position == -1:
+                        do_checkpoint = False
 
                     (uid,) = batch_generator.insert(
                         [rest],

@@ -5,12 +5,19 @@ import io
 import json
 import threading
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import mlx.core as mx
 import requests
 
 from mlx_lm.models.cache import KVCache
-from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
+from mlx_lm.server import (
+    APIHandler,
+    CompletionRequest,
+    LRUPromptCache,
+    ResponseGenerator,
+)
 from mlx_lm.utils import load
 
 
@@ -172,6 +179,103 @@ class TestServer(unittest.TestCase):
         response_body = response.text
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
+
+    def test_compute_prompt_checkpoint_uses_boundary_before_last_user_message(self):
+        tokenizer = MagicMock()
+        tokenizer.has_chat_template = True
+        tokenizer.has_tool_calling = True
+        tokenizer.has_thinking = False
+        tokenizer.apply_chat_template.return_value = [11, 22, 33]
+
+        request = CompletionRequest(
+            request_type="chat",
+            prompt="",
+            messages=[
+                {"role": "system", "content": "System guidance."},
+                {"role": "user", "content": "Static polishing rules."},
+                {"role": "user", "content": "Working text:\nHello world"},
+            ],
+            tools=None,
+            role_mapping=None,
+        )
+        args = SimpleNamespace(chat_template_kwargs=None)
+
+        should_checkpoint, checkpoint_position = (
+            self.response_generator._compute_prompt_checkpoint(
+                tokenizer,
+                request,
+                args,
+                [11, 22, 33, 44, 55],
+            )
+        )
+
+        self.assertTrue(should_checkpoint)
+        self.assertEqual(checkpoint_position, 3)
+        tokenizer.apply_chat_template.assert_called_once()
+        call_messages = tokenizer.apply_chat_template.call_args.args[0]
+        self.assertEqual(
+            call_messages,
+            [
+                {"role": "system", "content": "System guidance."},
+                {"role": "user", "content": "Static polishing rules."},
+            ],
+        )
+        self.assertFalse(
+            tokenizer.apply_chat_template.call_args.kwargs["add_generation_prompt"]
+        )
+
+    def test_compute_prompt_checkpoint_falls_back_when_prefix_has_no_user_message(self):
+        tokenizer = MagicMock()
+        tokenizer.has_chat_template = True
+        tokenizer.has_tool_calling = True
+        tokenizer.has_thinking = False
+
+        request = CompletionRequest(
+            request_type="chat",
+            prompt="",
+            messages=[
+                {"role": "system", "content": "System guidance."},
+                {"role": "user", "content": "Working text:\nHello world"},
+            ],
+            tools=None,
+            role_mapping=None,
+        )
+        args = SimpleNamespace(chat_template_kwargs=None)
+
+        should_checkpoint, checkpoint_position = (
+            self.response_generator._compute_prompt_checkpoint(
+                tokenizer,
+                request,
+                args,
+                [11, 22, 33],
+            )
+        )
+
+        self.assertTrue(should_checkpoint)
+        self.assertEqual(checkpoint_position, -1)
+        tokenizer.apply_chat_template.assert_not_called()
+
+    def test_adjust_prompt_checkpoint_for_cached_prefix(self):
+        self.assertEqual(
+            self.response_generator._adjust_prompt_checkpoint_for_cached_prefix(422, 0),
+            422,
+        )
+        self.assertEqual(
+            self.response_generator._adjust_prompt_checkpoint_for_cached_prefix(
+                422, 300
+            ),
+            122,
+        )
+        self.assertEqual(
+            self.response_generator._adjust_prompt_checkpoint_for_cached_prefix(
+                422, 422
+            ),
+            -1,
+        )
+        self.assertEqual(
+            self.response_generator._adjust_prompt_checkpoint_for_cached_prefix(-1, 422),
+            -1,
+        )
 
     def test_handle_chat_completions_with_null_tool_content(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
@@ -477,6 +581,21 @@ class TestLRUPromptCache(unittest.TestCase):
         c[0].update_and_fetch(*get_kv(8))
         cache.insert_cache(model, tokens, c)
         self.assertEqual(len(cache), 2)
+
+    def test_non_checkpoint_insert_preserves_checkpoint_prefix(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+
+        cache.insert_cache(model, [1, 2, 3], [MockCache("checkpoint")], checkpoint=True)
+        cache.insert_cache(model, [1, 2, 3, 4], [MockCache("full")])
+
+        c, t = cache.fetch_nearest_cache(model, [1, 2, 3, 5])
+        self.assertEqual(c, [MockCache("checkpoint")])
+        self.assertEqual(t, [5])
+
+        c, t = cache.fetch_nearest_cache(model, [1, 2, 3, 4])
+        self.assertEqual(c, [MockCache("full")])
+        self.assertEqual(t, [])
 
     def test_lru(self):
         cache = LRUPromptCache(max_size=2)
