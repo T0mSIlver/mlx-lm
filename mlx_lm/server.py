@@ -91,7 +91,11 @@ class ToolCallFormatter:
         return result
 
 
-def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
+def convert_chat(
+    messages: List[dict],
+    role_mapping: Optional[dict] = None,
+    add_generation_prompt: bool = True,
+):
     default_role_mapping = {
         "system_prompt": (
             "A chat between a curious user and an artificial intelligence "
@@ -111,7 +115,8 @@ def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
         content = line.get("content", "")
         prompt += f"{role_prefix}{content}{stop}"
 
-    prompt += role_mapping.get("assistant", "")
+    if add_generation_prompt:
+        prompt += role_mapping.get("assistant", "")
     return prompt.rstrip()
 
 
@@ -513,6 +518,47 @@ class ResponseGenerator:
         rq = request[0] if request is not None else Queue()
         return rq, *shareable
 
+    def _tokenize_chat_messages(
+        self,
+        tokenizer,
+        messages,
+        tools,
+        role_mapping,
+        args,
+        *,
+        add_generation_prompt: bool,
+    ):
+        if tokenizer.has_chat_template:
+            process_message_content(messages)
+            if tools and not tokenizer.has_tool_calling:
+                logging.warning(
+                    "Received tools but model does not support tool calling. "
+                    "If you think this is an error, file an issue here: "
+                    "https://github.com/ml-explore/mlx-lm/issues"
+                )
+
+            chat_template_args = self.model_provider.cli_args.chat_template_args
+            if args.chat_template_kwargs:
+                chat_template_args = chat_template_args.copy()
+                chat_template_args.update(args.chat_template_kwargs)
+            template_kwargs = dict(
+                tools=tools,
+                add_generation_prompt=add_generation_prompt,
+                tokenize=True,
+                **chat_template_args,
+            )
+            if tokenizer.has_thinking and "enable_thinking" not in template_kwargs:
+                template_kwargs["enable_thinking"] = False
+            return tokenizer.apply_chat_template(messages, **template_kwargs)
+
+        return tokenizer.encode(
+            convert_chat(
+                messages,
+                role_mapping,
+                add_generation_prompt=add_generation_prompt,
+            )
+        )
+
     def _tokenize(self, tokenizer, request, args):
         """Tokenize a request and split the prompt into segments.
 
@@ -532,32 +578,14 @@ class ResponseGenerator:
             tools = request.tools
             role_mapping = request.role_mapping
 
-            if tokenizer.has_chat_template:
-                process_message_content(messages)
-                if tools and not tokenizer.has_tool_calling:
-                    logging.warning(
-                        "Received tools but model does not support tool calling. "
-                        "If you think this is an error, file an issue here: "
-                        "https://github.com/ml-explore/mlx-lm/issues"
-                    )
-
-                chat_template_args = self.model_provider.cli_args.chat_template_args
-                if args.chat_template_kwargs:
-                    chat_template_args = chat_template_args.copy()
-                    chat_template_args.update(args.chat_template_kwargs)
-                template_kwargs = dict(
-                    tools=tools,
-                    tokenize=True,
-                    **chat_template_args,
-                )
-                prompt = tokenizer.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    **template_kwargs,
-                )
-            else:
-                prompt = tokenizer.encode(convert_chat(messages, role_mapping))
-                return prompt, [prompt], ["assistant"], "normal"
+            prompt = self._tokenize_chat_messages(
+                tokenizer,
+                messages,
+                tools,
+                role_mapping,
+                args,
+                add_generation_prompt=True,
+            )
         else:
             prompt = tokenizer.encode(request.prompt)
             return prompt, [prompt], ["assistant"], "normal"
@@ -589,10 +617,13 @@ class ResponseGenerator:
             else:
                 break
         if num_system > 0:
-            sys_tokens = tokenizer.apply_chat_template(
+            sys_tokens = self._tokenize_chat_messages(
+                tokenizer,
                 messages[:num_system] + [{"role": "user", "content": ""}],
+                tools,
+                role_mapping,
+                args,
                 add_generation_prompt=False,
-                **template_kwargs,
             )
             for i, (a, b) in enumerate(zip(sys_tokens, prompt)):
                 if a != b:
@@ -610,10 +641,38 @@ class ResponseGenerator:
             if think_start >= 0:
                 tail_start = think_start
 
+        # If there is stable chat context before the final user message, split
+        # there so the server can retain that reusable prefix independently of
+        # the dynamic final user content.
+        prefix_end = None
+        prefix_messages = messages[:-1]
+        if prefix_messages and any(m.get("role") == "user" for m in prefix_messages):
+            try:
+                prefix_prompt = self._tokenize_chat_messages(
+                    tokenizer,
+                    prefix_messages,
+                    tools,
+                    role_mapping,
+                    args,
+                    add_generation_prompt=False,
+                )
+                if sys_end < len(prefix_prompt) < tail_start:
+                    prefix_end = len(prefix_prompt)
+            except Exception:
+                logging.debug(
+                    "Falling back to default chat prompt segmentation.",
+                    exc_info=True,
+                )
+
         # Finalize the segments and return
-        if sys_end < tail_start:
-            segments.append(prompt[sys_end:tail_start])
+        segment_start = sys_end
+        if prefix_end is not None:
+            segments.append(prompt[segment_start:prefix_end])
             segment_types.append("user")
+            segment_start = prefix_end
+        if segment_start < tail_start:
+            segments.append(prompt[segment_start:tail_start])
+            segment_types.append("assistant" if prefix_end is not None else "user")
         if tail_start < len(prompt):
             segments.append(prompt[tail_start:])
             segment_types.append("assistant")

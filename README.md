@@ -1,3 +1,23 @@
+## What this fork changes
+
+This fork is rebased on upstream `ml-explore/mlx-lm` main and keeps a small
+server-side prompt-cache optimization for repeated polishing requests:
+
+- **Chat prompt-cache checkpointing for split prompts**: `mlx_lm.server` adds a
+  cache boundary before the final `user` message when earlier chat messages
+  already include reusable user context, so prompts shaped like
+  `system + static user + dynamic user` can reuse the stable prefix.
+- **Stable prefix preservation**: reusable `system` and `user` prefix caches are
+  no longer displaced by later, longer `assistant` caches on the same token path.
+- **Polishing-friendly chat defaults**: thinking-capable chat templates default
+  to `enable_thinking=false` unless the CLI or request explicitly overrides it,
+  keeping short polishing completions in `message.content`.
+- **Upstream stream handling retained**: generation uses upstream's
+  thread-local stream plumbing, including the server generation-thread stream
+  passed into `BatchGenerator`.
+
+---
+
 ## MLX LM 
 
 MLX LM is a Python package for generating text and fine-tuning large language

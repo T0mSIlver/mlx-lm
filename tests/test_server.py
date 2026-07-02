@@ -6,6 +6,7 @@ import json
 import threading
 import types
 import unittest
+from unittest.mock import MagicMock
 
 import mlx.core as mx
 import requests
@@ -247,6 +248,77 @@ class TestServer(unittest.TestCase):
         response_body = response.text
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
+
+    def test_tokenize_splits_reusable_prefix_before_final_user_message(self):
+        response_generator = ResponseGenerator.__new__(ResponseGenerator)
+        response_generator.model_provider = types.SimpleNamespace(
+            cli_args=types.SimpleNamespace(chat_template_args={})
+        )
+
+        tokenizer = MagicMock()
+        tokenizer.has_chat_template = True
+        tokenizer.has_tool_calling = True
+        tokenizer.has_thinking = False
+
+        full_prompt = [1, 2, 3, 4, 5, 6, 7, 8]
+        prefix_prompt = [1, 2, 3, 4, 5]
+        system_probe = [1, 2, 99]
+
+        def apply_chat_template(messages, **kwargs):
+            if messages[-1]["content"] == "":
+                return system_probe
+            if len(messages) == 2:
+                return prefix_prompt
+            return full_prompt
+
+        tokenizer.apply_chat_template.side_effect = apply_chat_template
+
+        request = types.SimpleNamespace(
+            request_type="chat",
+            messages=[
+                {"role": "system", "content": "System guidance."},
+                {"role": "user", "content": "Static polishing rules."},
+                {"role": "user", "content": "Working text:\nHello world"},
+            ],
+            tools=None,
+            role_mapping=None,
+        )
+        args = types.SimpleNamespace(chat_template_kwargs=None)
+
+        prompt, segments, segment_types, initial_state = response_generator._tokenize(
+            tokenizer, request, args
+        )
+
+        self.assertEqual(prompt, full_prompt)
+        self.assertEqual(segments, [[1, 2], [3, 4, 5], [6, 7, 8]])
+        self.assertEqual(segment_types, ["system", "user", "assistant"])
+        self.assertEqual(initial_state, "normal")
+
+    def test_tokenize_chat_messages_defaults_thinking_off(self):
+        response_generator = ResponseGenerator.__new__(ResponseGenerator)
+        response_generator.model_provider = types.SimpleNamespace(
+            cli_args=types.SimpleNamespace(chat_template_args={})
+        )
+
+        tokenizer = MagicMock()
+        tokenizer.has_chat_template = True
+        tokenizer.has_tool_calling = True
+        tokenizer.has_thinking = True
+        tokenizer.apply_chat_template.return_value = [1, 2, 3]
+
+        args = types.SimpleNamespace(chat_template_kwargs=None)
+        response_generator._tokenize_chat_messages(
+            tokenizer,
+            [{"role": "user", "content": "Hello"}],
+            None,
+            None,
+            args,
+            add_generation_prompt=True,
+        )
+
+        self.assertFalse(
+            tokenizer.apply_chat_template.call_args.kwargs["enable_thinking"]
+        )
 
     def test_handle_chat_completions_with_null_tool_content(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
@@ -638,6 +710,21 @@ class TestLRUPromptCache(unittest.TestCase):
         cache.insert_cache(model, [1, 2, 3], [MockCache("abc")])
         self.assertEqual(len(cache), 1)
         self.assertEqual(cache.nbytes, 3)
+
+    def test_assistant_insert_preserves_reusable_user_prefix(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+
+        cache.insert_cache(model, [1, 2, 3], [MockCache("user")], cache_type="user")
+        cache.insert_cache(model, [1, 2, 3, 4], [MockCache("full")])
+
+        c, t = cache.fetch_nearest_cache(model, [1, 2, 3, 5])
+        self.assertEqual(c, [MockCache("user")])
+        self.assertEqual(t, [5])
+
+        c, t = cache.fetch_nearest_cache(model, [1, 2, 3, 4])
+        self.assertEqual(c, [MockCache("full")])
+        self.assertEqual(t, [])
 
     def test_insert_empty_tokens_does_not_self_destruct(self):
         cache = LRUPromptCache(max_size=10)
