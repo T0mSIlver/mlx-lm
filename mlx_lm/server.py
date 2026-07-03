@@ -32,6 +32,7 @@ from typing import (
 import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
+from ._parent_watchdog import start_parent_watchdog
 from ._version import __version__
 from .generate import (
     BatchGenerator,
@@ -1943,7 +1944,16 @@ def main():
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
+    parser.add_argument(
+        "--parent-pid",
+        type=int,
+        default=None,
+        help="Exit when the process with this PID dies (for managed launchers).",
+    )
     args = parser.parse_args()
+    if args.parent_pid is not None:
+        start_parent_watchdog(args.parent_pid)
+
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)
