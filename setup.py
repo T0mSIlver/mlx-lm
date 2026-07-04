@@ -26,7 +26,10 @@ setup(
     install_requires=[
         f"mlx>={MIN_MLX_VERSION}; platform_system == 'Darwin'",
         "numpy",
-        "transformers>=5.7.0",
+        # <5.13: transformers 5.13.0 broke string-keyed AutoTokenizer.register
+        # ("str has no attribute __module__"), which tokenizer_utils.py uses
+        # for NewlineTokenizer. Re-test before raising the bound.
+        "transformers>=5.7.0,<5.13",
         "sentencepiece",
         "protobuf",
         "pyyaml",
