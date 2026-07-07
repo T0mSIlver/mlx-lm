@@ -1601,7 +1601,7 @@ class PromptTrie:
 
         # Check if we found a prefix at any point
         shorter = None
-        if last_index > 0:
+        if last_index >= 0:
             shorter = tokens[: last_index + 1]
 
         # Check for sequences that are longer
@@ -1648,6 +1648,16 @@ class LRUPromptCache:
                 except ValueError:
                     pass
 
+        def touch(self, model: Any, tokens: List[Any]):
+            for cache_type in self._ordering:
+                lru = self._lrus[cache_type]
+                try:
+                    lru.remove((model, tokens))
+                except ValueError:
+                    continue
+                lru.append((model, tokens))
+                break
+
         def pop(self):
             i = 0
             while i + 1 < len(self._ordering):
@@ -1677,6 +1687,7 @@ class LRUPromptCache:
         result = self._trie.search(model, tokens)
         if result.exact is not None:
             cache_entry = self._trie.get(result.model, result.exact)
+            self._lru.touch(result.model, result.exact)
             return copy.deepcopy(cache_entry.prompt_cache), []
 
         short_length = len(result.shorter) if result.shorter is not None else 0
@@ -1687,10 +1698,12 @@ class LRUPromptCache:
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
                 trim_prompt_cache(cache, num_to_trim)
+                self._lru.touch(result.model, result.longer)
                 return cache, tokens[prefix:]
 
         if short_length > 0:
             cache_entry = self._trie.get(result.model, result.shorter)
+            self._lru.touch(result.model, result.shorter)
             return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
 
         return None, tokens
