@@ -792,17 +792,17 @@ class TestPromptCacheReuseContract(unittest.TestCase):
                     c.maybe_trim_front()
                 c.update_and_fetch(kv, kv)
 
-    def test_chunked_cache_not_trimmable_after_slide(self):
+    def test_chunked_cache_stays_trimmable_after_slide(self):
+        # A slid chunked cache must remain trimmable so short suffix rewinds
+        # (e.g. speculative-decoding draft rejection) still work; only prefix
+        # *reuse* is unsafe, and that is handled in fetch_nearest_cache.
         cache = [KVCache(), ChunkedKVCache(chunk_size=512)]
-        self._prefill(cache, 0, 256)
-        self.assertEqual(cache[1].start_position, 0)
-        self.assertTrue(can_trim_prompt_cache(cache))
-
-        self._prefill(cache, 256, 1024)
+        self._prefill(cache, 0, 1024)
         self.assertGreater(cache[1].start_position, 0)
-        self.assertFalse(cache[1].is_trimmable())
-        self.assertFalse(can_trim_prompt_cache(cache))
-        self.assertEqual(trim_prompt_cache(cache, 993), 0)
+        self.assertTrue(cache[1].is_trimmable())
+        self.assertTrue(can_trim_prompt_cache(cache))
+        # A small suffix rewind trims fully on every layer.
+        self.assertEqual(trim_prompt_cache(cache, 4), 4)
 
     def test_fetch_with_slid_chunked_cache_recomputes(self):
         cache = [KVCache(), ChunkedKVCache(chunk_size=512)]
@@ -816,6 +816,58 @@ class TestPromptCacheReuseContract(unittest.TestCase):
         # A request sharing a short prefix must fall back to recompute
         # instead of reusing KV that no longer covers the prefix.
         request = list(range(32))
+        fetched, rest = lru.fetch_nearest_cache(model, request)
+        self.assertIsNone(fetched)
+        self.assertEqual(rest, request)
+
+    def test_fetch_slid_chunked_cache_behind_window_recomputes(self):
+        # A prefix inside the retained window but behind the current chunk
+        # boundary: the full trim succeeds, yet leading in-chunk tokens are
+        # gone, so reuse must still fall back to recompute.
+        cache = [KVCache(), ChunkedKVCache(chunk_size=512)]
+        self._prefill(cache, 0, 1024)
+        start = cache[1].start_position
+        self.assertGreater(start, 0)
+        prefix_len = start + 8
+        self.assertLess(prefix_len, 512)
+
+        lru = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        lru.insert_cache(model, list(range(1024)), cache, cache_type="system")
+
+        request = list(range(prefix_len)) + [9999]
+        fetched, rest = lru.fetch_nearest_cache(model, request)
+        self.assertIsNone(fetched)
+        self.assertEqual(rest, request)
+
+    def test_fetch_refuses_reuse_when_window_has_slid(self):
+        # A slid window (start_position > 0) can pass the trim-count guard yet
+        # still be missing leading in-chunk tokens, so it must not be reused.
+        class SlidCache:
+            def __init__(self, offset, start_position):
+                self.offset = offset
+                self.start_position = start_position
+
+            @property
+            def nbytes(self):
+                return self.offset
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                n = min(self.offset - self.start_position, n)
+                self.offset -= n
+                return n
+
+        lru = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        lru.insert_cache(model, list(range(16)), [SlidCache(16, 4)])
+
+        # Trimming 16 -> 8 removes 8 tokens, which fits inside the retained
+        # window (16 - 4 = 12 >= 8), so the trim-count guard alone would reuse
+        # it -- but tokens [0, 4) are gone, so reuse must fall back.
+        request = list(range(8)) + [99]
         fetched, rest = lru.fetch_nearest_cache(model, request)
         self.assertIsNone(fetched)
         self.assertEqual(rest, request)

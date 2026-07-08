@@ -113,6 +113,18 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     return min(c.trim(num_tokens) for c in cache)
 
 
+def _cache_window_has_slid(cache: List[Any]) -> bool:
+    """Whether any layer has physically dropped leading tokens.
+
+    A windowed cache such as ``ChunkedKVCache`` advances ``start_position``
+    once its window slides, discarding the earliest tokens. ``trim`` can only
+    remove tokens back to ``start_position``, so it can no longer reconstruct
+    an arbitrary shorter prefix even when the requested trim count fits inside
+    the retained window. Such a cache must not be reused as a keyed prefix.
+    """
+    return any(getattr(c, "start_position", 0) > 0 for c in cache)
+
+
 def create_attention_mask(
     N: int, offset: int, return_array: bool, window_size: Optional[int]
 ):
@@ -791,9 +803,7 @@ class ChunkedKVCache(_BaseCache):
         self.offset = self.keys.shape[2]
 
     def is_trimmable(self):
-        # Once the window has slid, the leading tokens are gone and trim()
-        # can no longer restore an arbitrary prefix exactly.
-        return self.start_position == 0
+        return True
 
     def trim(self, n):
         n = min(self.offset - self.start_position, n)
@@ -1700,7 +1710,13 @@ class LRUPromptCache:
         short_length = len(result.shorter) if result.shorter is not None else 0
         if result.longer is not None and result.common_prefix > short_length:
             cache_entry = self._trie.get(result.model, result.longer)
-            if can_trim_prompt_cache(cache_entry.prompt_cache):
+            # A cache whose window has slid can no longer be trimmed back to an
+            # arbitrary prefix: even a trim count that fits inside the retained
+            # window leaves the leading in-chunk tokens missing, so the state
+            # would not match tokens[:prefix]. Fall back to recompute instead.
+            if can_trim_prompt_cache(
+                cache_entry.prompt_cache
+            ) and not _cache_window_has_slid(cache_entry.prompt_cache):
                 cache = copy.deepcopy(cache_entry.prompt_cache)
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
