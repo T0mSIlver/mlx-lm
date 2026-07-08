@@ -15,7 +15,9 @@ from mlx_lm.models.cache import (
     BatchRotatingKVCache,
     CacheList,
     ChunkedKVCache,
+    ConcatenateKVCache,
     KVCache,
+    LRUPromptCache,
     QuantizedKVCache,
     RotatingKVCache,
     load_prompt_cache,
@@ -767,6 +769,84 @@ class TestPromptCache(unittest.TestCase):
         mask = create_attention_mask(h, c, window_size=4)
         expected = create_causal_mask(1, offset=32, window_size=4)
         self.assertTrue(mx.array_equal(mask, expected))
+
+
+class TestPromptCacheReuseContract(unittest.TestCase):
+    """Reuse must never return KV state that doesn't match the keyed prefix
+    (ml-explore/mlx-lm#1494)."""
+
+    def _position_kv(self, start, end):
+        # KV for position p is the scalar p so cache contents are
+        # self-describing.
+        pos = mx.arange(start, end, dtype=mx.float32).reshape(1, 1, end - start, 1)
+        return mx.broadcast_to(pos, (1, 1, end - start, 4))
+
+    def _prefill(self, cache, start, end, step=256):
+        # Feed tokens the way llama4 does: slide the window, then update.
+        for lo in range(start, end, step):
+            hi = min(lo + step, end)
+            kv = self._position_kv(lo, hi)
+            for c in cache:
+                if isinstance(c, ChunkedKVCache):
+                    c.maybe_trim_front()
+                c.update_and_fetch(kv, kv)
+
+    def test_fetch_with_slid_chunked_cache_recomputes(self):
+        cache = [KVCache(), ChunkedKVCache(chunk_size=512)]
+        self._prefill(cache, 0, 1024)
+        self.assertGreater(cache[1].start_position, 0)
+
+        lru = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        lru.insert_cache(model, list(range(1024)), cache, cache_type="system")
+
+        # A request sharing a short prefix must fall back to recompute
+        # instead of reusing KV that no longer covers the prefix (the chunked
+        # layer can only trim back to its window, so the trim is incomplete).
+        request = list(range(32))
+        fetched, rest = lru.fetch_nearest_cache(model, request)
+        self.assertIsNone(fetched)
+        self.assertEqual(rest, request)
+
+    def test_fetch_longer_falls_back_when_trim_incomplete(self):
+        class PartialTrimCache:
+            def __init__(self, offset, max_trim):
+                self.offset = offset
+                self.max_trim = max_trim
+
+            @property
+            def nbytes(self):
+                return self.offset
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                n = min(self.max_trim, n)
+                self.offset -= n
+                return n
+
+        lru = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        lru.insert_cache(model, list(range(16)), [PartialTrimCache(16, 4)])
+
+        # Trimming 16 -> 8 needs 8 tokens but the cache can only trim 4,
+        # so the entry must not be reused.
+        fetched, rest = lru.fetch_nearest_cache(model, list(range(8)) + [99])
+        self.assertIsNone(fetched)
+        self.assertEqual(rest, list(range(8)) + [99])
+
+    def test_concatenate_cache_trim_drops_kv(self):
+        cache = ConcatenateKVCache()
+        kv = self._position_kv(0, 8)
+        cache.update_and_fetch(kv, kv)
+        self.assertEqual(cache.trim(4), 4)
+        self.assertEqual(cache.offset, 4)
+
+        new = self._position_kv(100, 101)
+        keys, _ = cache.update_and_fetch(new, new)
+        self.assertEqual(cache.offset, 5)
+        self.assertEqual(keys[0, 0, :, 0].tolist(), [0.0, 1.0, 2.0, 3.0, 100.0])
 
 
 if __name__ == "__main__":

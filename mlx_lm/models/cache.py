@@ -104,11 +104,13 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
         num_tokens (int): The number of tokens to trim.
 
     Returns:
-        (int): The number of tokens that were trimmed.
+        (int): The number of tokens that were trimmed from every layer. If
+        this is less than ``num_tokens`` the trim was incomplete and the cache
+        should not be reused as an exact prefix.
     """
     if not can_trim_prompt_cache(cache) or len(cache) == 0:
         return 0
-    return [c.trim(num_tokens) for c in cache][0]
+    return min(c.trim(num_tokens) for c in cache)
 
 
 def create_attention_mask(
@@ -213,6 +215,9 @@ class ConcatenateKVCache(_BaseCache):
 
     def trim(self, n):
         n = min(self.offset, n)
+        if n > 0 and self.keys is not None:
+            self.keys = self.keys[..., : self.offset - n, :]
+            self.values = self.values[..., : self.offset - n, :]
         self.offset -= n
         return n
 
@@ -1684,8 +1689,11 @@ class LRUPromptCache:
                 cache = copy.deepcopy(cache_entry.prompt_cache)
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
-                trim_prompt_cache(cache, num_to_trim)
-                return cache, tokens[prefix:]
+                # Only reuse the cache if every layer trimmed the full amount;
+                # otherwise the state no longer corresponds to tokens[:prefix]
+                # and reusing it would produce wrong output.
+                if trim_prompt_cache(cache, num_to_trim) == num_to_trim:
+                    return cache, tokens[prefix:]
 
         if short_length > 0:
             cache_entry = self._trie.get(result.model, result.shorter)
