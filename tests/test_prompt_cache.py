@@ -848,6 +848,61 @@ class TestPromptCacheReuseContract(unittest.TestCase):
         self.assertEqual(cache.offset, 5)
         self.assertEqual(keys[0, 0, :, 0].tolist(), [0.0, 1.0, 2.0, 3.0, 100.0])
 
+    def test_fetch_slid_chunked_cache_behind_window_recomputes(self):
+        # End-to-end: a slid ChunkedKVCache where the requested prefix lands
+        # inside the retained window but behind the current chunk boundary, so
+        # the full trim succeeds yet leading in-chunk tokens are gone.
+        cache = [KVCache(), ChunkedKVCache(chunk_size=512)]
+        self._prefill(cache, 0, 1024)
+        start = cache[1].start_position
+        self.assertGreater(start, 0)
+        # Prefix just past start_position but still inside the first chunk: a
+        # fresh prefill of these tokens would not have slid and would attend
+        # over [0, prefix); the trimmed slid cache is missing [0, start).
+        prefix_len = start + 8
+        self.assertLess(prefix_len, 512)
+
+        lru = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        lru.insert_cache(model, list(range(1024)), cache, cache_type="system")
+
+        request = list(range(prefix_len)) + [9999]
+        fetched, rest = lru.fetch_nearest_cache(model, request)
+        self.assertIsNone(fetched)
+        self.assertEqual(rest, request)
+
+    def test_fetch_refuses_reuse_when_window_has_slid(self):
+        # A slid window (start_position > 0) can pass the trim-count guard yet
+        # still be missing leading in-chunk tokens, so it must not be reused.
+        class SlidCache:
+            def __init__(self, offset, start_position):
+                self.offset = offset
+                self.start_position = start_position
+
+            @property
+            def nbytes(self):
+                return self.offset
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                n = min(self.offset - self.start_position, n)
+                self.offset -= n
+                return n
+
+        lru = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        lru.insert_cache(model, list(range(16)), [SlidCache(16, 4)])
+
+        # Trimming 16 -> 8 removes 8 tokens, which fits inside the retained
+        # window (16 - 4 = 12 >= 8), so the trim-count guard alone would reuse
+        # it -- but tokens [0, 4) are gone, so reuse must fall back.
+        request = list(range(8)) + [99]
+        fetched, rest = lru.fetch_nearest_cache(model, request)
+        self.assertIsNone(fetched)
+        self.assertEqual(rest, request)
+
 
 if __name__ == "__main__":
     unittest.main()
